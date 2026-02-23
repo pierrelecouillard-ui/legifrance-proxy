@@ -53,6 +53,26 @@ function requireApiKey(req, res, next) {
   next();
 }
 
+// ✅ Route de diagnostic (ne révèle pas les secrets)
+app.get("/health", (req, res) => {
+  res.json({
+    env: ENV,
+    tokenUrl:
+      ENV === "production"
+        ? "https://oauth.piste.gouv.fr/api/oauth/token"
+        : "https://sandbox-oauth.piste.gouv.fr/api/oauth/token",
+    apiBase:
+      ENV === "production"
+        ? "https://api.piste.gouv.fr/dila/legifrance/lf-engine-app"
+        : "https://sandbox-api.piste.gouv.fr/dila/legifrance/lf-engine-app",
+    hasClientId: Boolean(CLIENT_ID),
+    hasClientSecret: Boolean(CLIENT_SECRET),
+    clientIdLen: CLIENT_ID ? String(CLIENT_ID).trim().length : 0,
+    clientSecretLen: CLIENT_SECRET ? String(CLIENT_SECRET).trim().length : 0,
+    apiKeysConfigured: API_KEYS.length,
+  });
+});
+
 if (!CLIENT_ID || !CLIENT_SECRET) {
   throw new Error("Missing PISTE_CLIENT_ID / PISTE_CLIENT_SECRET env vars");
 }
@@ -180,5 +200,12 @@ app.post("/legifrance/import", requireApiKey, async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 8787;
-app.listen(PORT, () => console.log(`Legifrance proxy running on :${PORT} (env=${ENV})`));
+const PORT = process.env.PORT || 8787; // 8787 en local, PORT en prod
+app.listen(PORT, () => {
+  console.log(`Legifrance proxy running on :${PORT} (env=${ENV})`);
+  console.log(
+    `[sanity] hasClientId=${Boolean(CLIENT_ID)} hasClientSecret=${Boolean(CLIENT_SECRET)} ` +
+      `clientIdLen=${CLIENT_ID ? String(CLIENT_ID).trim().length : 0} ` +
+      `clientSecretLen=${CLIENT_SECRET ? String(CLIENT_SECRET).trim().length : 0}`
+  );
+});
