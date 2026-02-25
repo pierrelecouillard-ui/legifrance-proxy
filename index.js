@@ -97,19 +97,20 @@ async function getToken() {
     return cachedToken;
   }
 
-  const body = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: String(CLIENT_ID).trim(),
-    client_secret: String(CLIENT_SECRET).trim(),
-  }).toString();
+  const id = String(CLIENT_ID).trim();
+  const secret = String(CLIENT_SECRET).trim();
+
+  // OAuth Client Credentials via HTTP Basic (plus compatible)
+  const basic = Buffer.from(`${id}:${secret}`).toString("base64");
 
   const r = await fetch(TOKEN_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Accept: "application/json",
+      Authorization: `Basic ${basic}`,
     },
-    body,
+    body: new URLSearchParams({ grant_type: "client_credentials" }).toString(),
   });
 
   if (!r.ok) throw new Error(`Token HTTP ${r.status}: ${await r.text()}`);
