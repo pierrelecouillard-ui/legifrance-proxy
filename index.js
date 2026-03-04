@@ -113,7 +113,7 @@ async function getToken() {
 function extractLegifranceId(raw) {
   const s = String(raw || "").trim();
   let m = s.match(
-    /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|LEGISCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
+    /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|JORFSCTA\d{12}|LEGISCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
   );
   if (m) return m[1];
   try {
@@ -127,7 +127,7 @@ function extractLegifranceId(raw) {
     ].filter(Boolean);
     for (const c of candidates) {
       m = String(c).match(
-        /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|LEGISCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
+        /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|JORFSCTA\d{12}|LEGISCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
       );
       if (m) return m[1];
     }
@@ -179,6 +179,13 @@ async function consultById(id) {
     });
   }
 
+  // Sections (JORF / LEGI)
+  if (id.startsWith("JORFSCTA") || id.startsWith("LEGISCTA")) {
+    // endpoint section (best-effort)
+    return await postJson("/consult/getSection", { id });
+  }
+
+
   if (id.startsWith("KALIARTI")) return await postJson("/consult/kaliArticle", { id });
   if (id.startsWith("KALITEXT")) return await postJson("/consult/kaliText", { id });
 
@@ -188,6 +195,38 @@ async function consultById(id) {
 
 
 // ✅ NOUVEL endpoint attendu par ton AppCore
+
+// ✅ Consult + annexes (résout les sections "Annexe" d'un JORFTEXT)
+app.post("/legifrance/consultDeep", requireApiKey, async (req, res) => {
+  try {
+    const bodyId = req.body?.id ? String(req.body.id) : null;
+    const bodyUrl = req.body?.url ? String(req.body.url) : "";
+    const id = bodyId || extractLegifranceId(bodyUrl);
+    if (!id) return res.status(400).json({ error: "Missing or invalid Legifrance id/url" });
+
+    const data = await consultById(id);
+
+    // Résolution best-effort des annexes (sections) uniquement pour JORFTEXT
+    const annexes = [];
+    const secs = Array.isArray(data?.sections) ? data.sections : [];
+    for (const s of secs) {
+      const sid = s?.id || s?.cid;
+      if (typeof sid !== "string") continue;
+      if (!/^JORFSCTA\d{12}$/.test(sid)) continue;
+      try {
+        const sdata = await consultById(sid);
+        annexes.push({ id: sid, data: sdata });
+      } catch (e) {
+        annexes.push({ id: sid, error: String(e?.message ?? e) });
+      }
+    }
+
+    res.json({ id, data, annexes });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e) });
+  }
+});
+
 app.post("/legifrance/consult", requireApiKey, async (req, res) => {
   try {
     const bodyId = req.body?.id ? String(req.body.id) : null;
