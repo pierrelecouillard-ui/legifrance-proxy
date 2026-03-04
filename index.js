@@ -144,6 +144,31 @@ async function pistePost(endpoint, payload) {
   }
 }
 
+
+async function consultSectionWithFallback(sectionId) {
+  const sid = String(sectionId);
+  let lastErr = null;
+
+  // Different deployments of the Legifrance API expose section consultation with slightly different endpoints/payloads.
+  // We try a small matrix of possibilities to maximize compatibility.
+  const tries = [
+    { endpoint: "/consult/jorf/section", payload: { id: sid } },
+    { endpoint: "/consult/jorf/section", payload: { cid: sid } },
+    { endpoint: "/consult/getSection", payload: { id: sid } },
+    { endpoint: "/consult/getSection", payload: { cid: sid } },
+  ];
+
+  for (const t of tries) {
+    try {
+      return await pistePost(t.endpoint, t.payload);
+    } catch (e) {
+      lastErr = e?.message ? String(e.message) : String(e);
+    }
+  }
+
+  throw new Error(lastErr || "PISTE section consult failed");
+}
+
 async function consultById(id) {
   const sid = String(id);
 
@@ -155,13 +180,7 @@ async function consultById(id) {
     return pistePost("/consult/legiPart", { date, textId: sid });
   }
   if (sid.startsWith("JORFSCTA") || sid.startsWith("LEGISCTA")) {
-    // According to the API, section access may be exposed as getSection
-    try {
-      return await pistePost("/consult/getSection", { id: sid });
-    } catch (e1) {
-      // fallback: some implementations use cid
-      return await pistePost("/consult/getSection", { cid: sid });
-    }
+    return consultSectionWithFallback(sid);
   }
   if (sid.startsWith("KALIARTI")) return pistePost("/consult/kaliArticle", { id: sid });
   if (sid.startsWith("KALITEXT")) return pistePost("/consult/kaliText", { id: sid });
