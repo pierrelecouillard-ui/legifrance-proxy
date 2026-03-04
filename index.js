@@ -123,6 +123,52 @@ async function getToken() {
   return cachedToken;
 }
 
+
+async function pistePost(endpoint, payload) {
+  const token = await getToken();
+  const r = await fetch(API_BASE + endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const t = await r.text();
+  if (!r.ok) throw new Error(`PISTE ${endpoint} HTTP ${r.status}: ${t}`);
+  try {
+    return JSON.parse(t);
+  } catch {
+    return { raw: t };
+  }
+}
+
+async function consultById(id) {
+  const sid = String(id);
+
+  if (sid.startsWith("JORFTEXT")) {
+    return pistePost("/consult/jorf", { textCid: sid });
+  }
+  if (sid.startsWith("LEGITEXT")) {
+    const date = new Date().toISOString().slice(0, 10);
+    return pistePost("/consult/legiPart", { date, textId: sid });
+  }
+  if (sid.startsWith("JORFSCTA") || sid.startsWith("LEGISCTA")) {
+    // According to the API, section access may be exposed as getSection
+    try {
+      return await pistePost("/consult/getSection", { id: sid });
+    } catch (e1) {
+      // fallback: some implementations use cid
+      return await pistePost("/consult/getSection", { cid: sid });
+    }
+  }
+  if (sid.startsWith("KALIARTI")) return pistePost("/consult/kaliArticle", { id: sid });
+  if (sid.startsWith("KALITEXT")) return pistePost("/consult/kaliText", { id: sid });
+
+  return pistePost("/consult/getArticle", { id: sid });
+}
+
 function extractLegifranceId(rawUrl) {
   const s = String(rawUrl || "").trim();
 
@@ -154,53 +200,40 @@ function extractLegifranceId(rawUrl) {
   return null;
 }
 
+
 app.post("/legifrance/import", requireApiKey, async (req, res) => {
   try {
-    const url = String(req.body?.url ?? "");
-    const id = extractLegifranceId(url);
+    const bodyId = req.body?.id ? String(req.body.id) : null;
+    const bodyUrl = req.body?.url ? String(req.body.url) : String(req.body?.url ?? "");
+    const id = bodyId || extractLegifranceId(bodyUrl);
     if (!id) return res.status(400).json({ error: "URL does not contain a known Legifrance ID" });
 
-    const token = await getToken();
-
-    let endpoint;
-    let payload;
-
-    if (id.startsWith("JORFTEXT")) {
-      endpoint = "/consult/jorf";
-      payload = { textCid: id };
-    } else if (id.startsWith("LEGITEXT")) {
-      endpoint = "/consult/legiPart";
-      payload = { date: new Date().toISOString().slice(0, 10), textId: id };
-    } else if (id.startsWith("KALIARTI")) {
-      endpoint = "/consult/kaliArticle";
-      payload = { id };
-    } else if (id.startsWith("KALITEXT")) {
-      endpoint = "/consult/kaliText";
-      payload = { id };
-    } else {
-      endpoint = "/consult/getArticle";
-      payload = { id };
-    }
-
-    const r = await fetch(API_BASE + endpoint, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!r.ok) throw new Error(`Consult HTTP ${r.status}: ${await r.text()}`);
-    const data = await r.json();
-
+    const data = await consultById(id);
     res.json({ id, data });
   } catch (e) {
     res.status(500).json({ error: String(e?.message ?? e) });
   }
 });
 
+
+
+
+
+// ✅ endpoint attendu par AppCore : consultation simple par {id,url}
+app.post("/legifrance/consult", requireApiKey, async (req, res) => {
+  try {
+    const bodyId = req.body?.id ? String(req.body.id) : null;
+    const bodyUrl = req.body?.url ? String(req.body.url) : "";
+
+    const id = bodyId || extractLegifranceId(bodyUrl);
+    if (!id) return res.status(400).json({ error: "Missing or invalid Legifrance id/url" });
+
+    const data = await consultById(id);
+    res.json({ id, data });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e) });
+  }
+});
 
 // ✅ Consult + resolve annexes (sections) in one call
 app.post("/legifrance/consultDeep", requireApiKey, async (req, res) => {
