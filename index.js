@@ -192,6 +192,62 @@ async function consultById(id) {
   return pistePost("/consult/getArticle", { id });
 }
 
+
+// ✅ Recherche via PISTE (évite Cloudflare)
+// Body attendu (simple):
+// { query: "cap carreleur mosaïste", fond?: "JORF"|"LODA_DATE"|"ALL", pageSize?: 25, pageNumber?: 1 }
+//
+// Le proxy construit une requête "search" de l'API Légifrance (lf-engine-app/search)
+// en ciblant principalement le TITLE, et en filtrant par NATURE=ARRETE par défaut.
+app.post("/legifrance/search", requireApiKey, async (req, res) => {
+  try {
+    const query = String(req.body?.query || req.body?.q || "").trim();
+    if (!query) return res.status(400).json({ error: "Missing query" });
+
+    const fond = String(req.body?.fond || "JORF").trim(); // ex: JORF, LODA_DATE, ALL
+    const pageSize = Math.min(Number(req.body?.pageSize ?? 25) || 25, 100);
+    const pageNumber = Math.max(Number(req.body?.pageNumber ?? 1) || 1, 1);
+
+    const payload = {
+      fond,
+      recherche: {
+        champs: [
+          {
+            typeChamp: "TITLE",
+            operateur: "ET",
+            criteres: [
+              {
+                typeRecherche: "UN_DES_MOTS",
+                valeur: query,
+                operateur: "ET",
+              },
+            ],
+          },
+        ],
+        // Par défaut, on vise les textes "arrêté" (souvent le cas pour les diplômes)
+        filtres: Array.isArray(req.body?.filtres)
+          ? req.body.filtres
+          : [
+              {
+                facette: "NATURE",
+                valeurs: ["ARRETE"],
+              },
+            ],
+        operateur: "ET",
+        pageNumber,
+        pageSize,
+        sort: String(req.body?.sort || "SIGNATURE_DATE_DESC"),
+        typePagination: String(req.body?.typePagination || "DEFAUT"),
+      },
+    };
+
+    const data = await pistePost("/search", payload);
+    res.json({ query, fond, data });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e) });
+  }
+});
+
 // ✅ NOUVEL endpoint attendu par ton AppCore
 app.post("/legifrance/consult", requireApiKey, async (req, res) => {
   try {
