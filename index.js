@@ -9,7 +9,7 @@ const app = express();
 // pour que le rate limit utilise la vraie IP client.
 app.set("trust proxy", 1);
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 // CORS minimal (utile en dev navigateur)
 app.use((req, res, next) => {
@@ -35,7 +35,7 @@ const ENV = process.env.PISTE_ENV ?? "sandbox";
 const CLIENT_ID = process.env.PISTE_CLIENT_ID ?? process.env.LEGIFRANCE_CLIENT_ID;
 const CLIENT_SECRET = process.env.PISTE_CLIENT_SECRET ?? process.env.LEGIFRANCE_CLIENT_SECRET;
 
-// API keys "internes" pour tes collègues (recommandé en prod)
+// API keys "internes" (recommandé en prod)
 // Exemple : APP_API_KEYS=cle1,cle2,cle3
 const API_KEYS = String(process.env.APP_API_KEYS ?? "")
   .split(",")
@@ -93,9 +93,7 @@ let tokenExpiresAt = 0;
 
 async function getToken() {
   const now = Date.now();
-  if (cachedToken && now < tokenExpiresAt - 10_000) {
-    return cachedToken;
-  }
+  if (cachedToken && now < tokenExpiresAt - 10_000) return cachedToken;
 
   const id = String(CLIENT_ID).trim();
   const secret = String(CLIENT_SECRET).trim();
@@ -123,77 +121,12 @@ async function getToken() {
   return cachedToken;
 }
 
-
-async function pistePost(endpoint, payload) {
-  const token = await getToken();
-  const r = await fetch(API_BASE + endpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-  const t = await r.text();
-  if (!r.ok) throw new Error(`PISTE ${endpoint} HTTP ${r.status}: ${t}`);
-  try {
-    return JSON.parse(t);
-  } catch {
-    return { raw: t };
-  }
-}
-
-
-async function consultSectionWithFallback(sectionId) {
-  const sid = String(sectionId);
-  let lastErr = null;
-
-  // Different deployments of the Legifrance API expose section consultation with slightly different endpoints/payloads.
-  // We try a small matrix of possibilities to maximize compatibility.
-  const tries = [
-    { endpoint: "/consult/jorf/section", payload: { id: sid } },
-    { endpoint: "/consult/jorf/section", payload: { cid: sid } },
-    { endpoint: "/consult/getSection", payload: { id: sid } },
-    { endpoint: "/consult/getSection", payload: { cid: sid } },
-  ];
-
-  for (const t of tries) {
-    try {
-      return await pistePost(t.endpoint, t.payload);
-    } catch (e) {
-      lastErr = e?.message ? String(e.message) : String(e);
-    }
-  }
-
-  throw new Error(lastErr || "PISTE section consult failed");
-}
-
-async function consultById(id) {
-  const sid = String(id);
-
-  if (sid.startsWith("JORFTEXT")) {
-    return pistePost("/consult/jorf", { textCid: sid });
-  }
-  if (sid.startsWith("LEGITEXT")) {
-    const date = new Date().toISOString().slice(0, 10);
-    return pistePost("/consult/legiPart", { date, textId: sid });
-  }
-  if (sid.startsWith("JORFSCTA") || sid.startsWith("LEGISCTA")) {
-    return consultSectionWithFallback(sid);
-  }
-  if (sid.startsWith("KALIARTI")) return pistePost("/consult/kaliArticle", { id: sid });
-  if (sid.startsWith("KALITEXT")) return pistePost("/consult/kaliText", { id: sid });
-
-  return pistePost("/consult/getArticle", { id: sid });
-}
-
 function extractLegifranceId(rawUrl) {
   const s = String(rawUrl || "").trim();
 
   // IDs en clair dans l’URL
   let m = s.match(
-    /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|JORFSCTA\d{12}|LEGISCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
+    /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|LEGISCTA\d{12}|JORFSCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
   );
   if (m) return m[1];
 
@@ -210,7 +143,7 @@ function extractLegifranceId(rawUrl) {
 
     for (const c of candidates) {
       m = String(c).match(
-        /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|JORFSCTA\d{12}|LEGISCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
+        /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|LEGISCTA\d{12}|JORFSCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
       );
       if (m) return m[1];
     }
@@ -219,26 +152,47 @@ function extractLegifranceId(rawUrl) {
   return null;
 }
 
+async function pistePost(endpoint, payload) {
+  const token = await getToken();
+  const r = await fetch(API_BASE + endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
 
-app.post("/legifrance/import", requireApiKey, async (req, res) => {
-  try {
-    const bodyId = req.body?.id ? String(req.body.id) : null;
-    const bodyUrl = req.body?.url ? String(req.body.url) : String(req.body?.url ?? "");
-    const id = bodyId || extractLegifranceId(bodyUrl);
-    if (!id) return res.status(400).json({ error: "URL does not contain a known Legifrance ID" });
-
-    const data = await consultById(id);
-    res.json({ id, data });
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message ?? e) });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`PISTE ${endpoint} HTTP ${r.status}: ${t}`);
   }
-});
+  return r.json();
+}
 
+async function consultById(id) {
+  // Important:
+  // - /consult/jorf attend { textCid }
+  // - /consult/legiPart attend { textId, date }
+  // - /consult/getArticle attend { id } pour les articles isolés
+  if (id.startsWith("JORFTEXT")) {
+    return pistePost("/consult/jorf", { textCid: id });
+  }
+  if (id.startsWith("LEGITEXT")) {
+    return pistePost("/consult/legiPart", { date: Date.now(), textId: id });
+  }
+  if (id.startsWith("KALIARTI")) {
+    return pistePost("/consult/kaliArticle", { id });
+  }
+  if (id.startsWith("KALITEXT")) {
+    return pistePost("/consult/kaliText", { id });
+  }
+  // articles / sections divers
+  return pistePost("/consult/getArticle", { id });
+}
 
-
-
-
-// ✅ endpoint attendu par AppCore : consultation simple par {id,url}
+// ✅ NOUVEL endpoint attendu par ton AppCore
 app.post("/legifrance/consult", requireApiKey, async (req, res) => {
   try {
     const bodyId = req.body?.id ? String(req.body.id) : null;
@@ -254,7 +208,31 @@ app.post("/legifrance/consult", requireApiKey, async (req, res) => {
   }
 });
 
-// ✅ Consult + resolve annexes (sections) in one call
+// Compat: garde /legifrance/import mais accepte {id,url}
+app.post("/legifrance/import", requireApiKey, async (req, res) => {
+  try {
+    const bodyId = req.body?.id ? String(req.body.id) : null;
+    const bodyUrl = req.body?.url ? String(req.body.url) : "";
+
+    const id = bodyId || extractLegifranceId(bodyUrl);
+    if (!id) return res.status(400).json({ error: "Missing or invalid Legifrance id/url" });
+
+    const data = await consultById(id);
+    res.json({ id, data });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message ?? e) });
+  }
+});
+
+/**
+ * ✅ consultDeep:
+ * - récupère le texte (consultById)
+ * - tente de récupérer le contenu des annexes (sections "Annexe") via
+ *   POST /chrono/textCidAndElementCid
+ *
+ * Pourquoi: l'ancien appel "getSection" donne parfois 403, alors que cet endpoint
+ * est documenté et (souvent) autorisé.
+ */
 app.post("/legifrance/consultDeep", requireApiKey, async (req, res) => {
   try {
     const bodyId = req.body?.id ? String(req.body.id) : null;
@@ -265,18 +243,30 @@ app.post("/legifrance/consultDeep", requireApiKey, async (req, res) => {
 
     const data = await consultById(id);
 
-    const annexes = [];
+    // Detect annex-like sections (JORF renvoie souvent "Annexe")
     const sections = Array.isArray(data?.sections) ? data.sections : [];
+    const annexSections = sections.filter((s) => String(s?.title ?? "").toLowerCase().includes("annexe"));
 
-    for (const s of sections) {
-      const sid = s?.id ? String(s.id) : null;
-      if (!sid) continue;
-      if (!(sid.startsWith("JORFSCTA") || sid.startsWith("LEGISCTA"))) continue;
+    const annexes = [];
+    for (const s of annexSections) {
+      const sectionCid = String(s?.cid ?? s?.id ?? "");
+      const title = String(s?.title ?? "Annexe");
+
+      if (!sectionCid) {
+        annexes.push({ id: null, title, error: "Missing section cid" });
+        continue;
+      }
+
       try {
-        const sectionData = await consultById(sid);
-        annexes.push({ id: sid, title: s?.title ?? "Annexe", data: sectionData });
-      } catch (e) {
-        annexes.push({ id: sid, title: s?.title ?? "Annexe", error: String(e?.message ?? e) });
+        // Endpoint OpenAPI: post/chrono/textCidAndElementCid
+        const excerpt = await pistePost("/chrono/textCidAndElementCid", {
+          textCid: id,
+          elementCid: sectionCid,
+        });
+
+        annexes.push({ id: sectionCid, title, excerpt });
+      } catch (err) {
+        annexes.push({ id: sectionCid, title, error: String(err?.message ?? err) });
       }
     }
 
