@@ -3,37 +3,29 @@ import express from "express";
 import fetch from "node-fetch";
 import rateLimit from "express-rate-limit";
 
-/**
- * legifrance-proxy (PISTE)
- *
- * - Évite les 403 Cloudflare (on ne scrape jamais legifrance.gouv.fr)
- * - Appelle l'API PISTE Légifrance (OAuth2)
- * - Expose des endpoints simples pour ton AppCore
- * - /legifrance/consultDeep essaie de récupérer le contenu complet via ELI
- */
-
 const app = express();
 
+// Si tu es derrière un reverse proxy (Render/Railway/Nginx), active ceci
+// pour que le rate limit utilise la vraie IP client.
 app.set("trust proxy", 1);
+
 app.use(express.json({ limit: "2mb" }));
 
-// CORS minimal
+// CORS minimal (utile en dev navigateur)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Api-Key"
-  );
+  // Ajout de x-api-key pour l’auth côté app
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// Rate limiting
+// Rate limiting (anti-abus)
 app.use(
   rateLimit({
-    windowMs: 60_000,
-    max: Number(process.env.RATE_LIMIT_MAX ?? 60),
+    windowMs: 60_000, // 1 min
+    max: Number(process.env.RATE_LIMIT_MAX ?? 60), // 60 req/min/IP par défaut
     standardHeaders: true,
     legacyHeaders: false,
   })
@@ -41,149 +33,166 @@ app.use(
 
 const ENV = process.env.PISTE_ENV ?? "sandbox";
 const CLIENT_ID = process.env.PISTE_CLIENT_ID ?? process.env.LEGIFRANCE_CLIENT_ID;
-const CLIENT_SECRET =
-  process.env.PISTE_CLIENT_SECRET ?? process.env.LEGIFRANCE_CLIENT_SECRET;
+const CLIENT_SECRET = process.env.PISTE_CLIENT_SECRET ?? process.env.LEGIFRANCE_CLIENT_SECRET;
 
-// Exemple : APP_API_KEYS=cle1,cle2
+// API keys "internes" (recommandé en prod)
+// Exemple : APP_API_KEYS=cle1,cle2,cle3
 const API_KEYS = String(process.env.APP_API_KEYS ?? "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-const tokenUrl =
-  ENV === "prod"
-    ? "https://oauth.piste.gouv.fr/api/oauth/token"
-    : "https://sandbox-oauth.piste.gouv.fr/api/oauth/token";
-
-const apiBase =
-  ENV === "prod"
-    ? "https://api.piste.gouv.fr/dila/legifrance/lf-engine-app"
-    : "https://sandbox-api.piste.gouv.fr/dila/legifrance/lf-engine-app";
-
 function requireApiKey(req, res, next) {
-  if (!API_KEYS.length) return next();
-  const key = req.header("x-api-key") || req.header("X-Api-Key");
-  if (!key || !API_KEYS.includes(String(key))) {
+  // Si aucune clé n’est définie, on n’exige rien (pratique en dev local)
+  if (API_KEYS.length === 0) return next();
+
+  const k = req.header("x-api-key") || req.header("X-Api-Key");
+  if (!k || !API_KEYS.includes(k)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 }
 
-// -------- OAuth / PISTE helpers --------
-
-let cachedToken = null;
-let cachedTokenExpMs = 0;
-
-async function getAccessToken() {
-  if (!CLIENT_ID || !CLIENT_SECRET) {
-    throw new Error("Missing PISTE_CLIENT_ID / PISTE_CLIENT_SECRET");
-  }
-
-  const now = Date.now();
-  if (cachedToken && now < cachedTokenExpMs - 10_000) return cachedToken;
-
-  const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
-  const r = await fetch(tokenUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: "grant_type=client_credentials",
-  });
-
-  const txt = await r.text();
-  if (!r.ok) throw new Error(`OAuth token HTTP ${r.status}: ${txt}`);
-
-  const json = JSON.parse(txt);
-  cachedToken = json.access_token;
-  const expiresInSec = Number(json.expires_in ?? 3600);
-  cachedTokenExpMs = now + expiresInSec * 1000;
-  return cachedToken;
-}
-
-async function pistePost(path, bodyObj) {
-  const token = await getAccessToken();
-  const url = `${apiBase}${path}`;
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(bodyObj ?? {}),
-  });
-
-  const txt = await r.text();
-  if (!r.ok) {
-    const err = new Error(`PISTE ${path} HTTP ${r.status}: ${txt}`);
-    err.status = r.status;
-    err.body = txt;
-    throw err;
-  }
-
-  return txt ? JSON.parse(txt) : null;
-}
-
-// -------- Utils --------
-
-function extractLegifranceId(input) {
-  const s = String(input ?? "").trim();
-  if (!s) return null;
-
-  // direct id
-  const direct = s.match(/^(JORFTEXT|LEGITEXT|LEGIARTI|JORFARTI)\d+/i);
-  if (direct) return direct[0].toUpperCase();
-
-  // from URL
-  const m = s.match(/\b(JORFTEXT|LEGITEXT|LEGIARTI|JORFARTI)\d+\b/i);
-  return m ? m[0].toUpperCase() : null;
-}
-
-async function consultById(id) {
-  return pistePost("/consult", { id: String(id) });
-}
-
-async function consultFullByEli(eliPath) {
-  const eli = String(eliPath ?? "").trim();
-  if (!eli) return null;
-  return pistePost("/consult/eliAndAliasRedirectionTexte", { idEliOrAlias: eli });
-}
-
-function extractAnnexesFromFull(full) {
-  const annexes = [];
-  const sections = Array.isArray(full?.sections) ? full.sections : [];
-
-  for (const s of sections) {
-    const title = String(s?.title ?? "");
-    if (!/annexe/i.test(title)) continue;
-    annexes.push({
-      id: s?.id ?? s?.cid ?? null,
-      title: title || "Annexe",
-      articles: Array.isArray(s?.articles) ? s.articles : [],
-      raw: s,
-    });
-  }
-
-  return annexes;
-}
-
-// -------- Routes --------
-
+// ✅ Route de diagnostic (ne révèle pas les secrets)
 app.get("/health", (req, res) => {
   res.json({
     env: ENV,
-    tokenUrl,
-    apiBase,
+    tokenUrl:
+      ENV === "production"
+        ? "https://oauth.piste.gouv.fr/api/oauth/token"
+        : "https://sandbox-oauth.piste.gouv.fr/api/oauth/token",
+    apiBase:
+      ENV === "production"
+        ? "https://api.piste.gouv.fr/dila/legifrance/lf-engine-app"
+        : "https://sandbox-api.piste.gouv.fr/dila/legifrance/lf-engine-app",
     hasClientId: Boolean(CLIENT_ID),
     hasClientSecret: Boolean(CLIENT_SECRET),
-    clientIdLen: CLIENT_ID ? String(CLIENT_ID).length : 0,
-    clientSecretLen: CLIENT_SECRET ? String(CLIENT_SECRET).length : 0,
+    clientIdLen: CLIENT_ID ? String(CLIENT_ID).trim().length : 0,
+    clientSecretLen: CLIENT_SECRET ? String(CLIENT_SECRET).trim().length : 0,
     apiKeysConfigured: API_KEYS.length,
   });
 });
 
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  throw new Error("Missing PISTE_CLIENT_ID / PISTE_CLIENT_SECRET env vars");
+}
+
+const TOKEN_URL =
+  ENV === "production"
+    ? "https://oauth.piste.gouv.fr/api/oauth/token"
+    : "https://sandbox-oauth.piste.gouv.fr/api/oauth/token";
+
+const API_BASE =
+  ENV === "production"
+    ? "https://api.piste.gouv.fr/dila/legifrance/lf-engine-app"
+    : "https://sandbox-api.piste.gouv.fr/dila/legifrance/lf-engine-app";
+
+// Cache token OAuth (évite de redemander un token à chaque appel)
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+async function getToken() {
+  const now = Date.now();
+  if (cachedToken && now < tokenExpiresAt - 10_000) return cachedToken;
+
+  const id = String(CLIENT_ID).trim();
+  const secret = String(CLIENT_SECRET).trim();
+
+  // OAuth Client Credentials via HTTP Basic (plus compatible)
+  const basic = Buffer.from(`${id}:${secret}`).toString("base64");
+
+  const r = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+      Authorization: `Basic ${basic}`,
+    },
+    body: new URLSearchParams({ grant_type: "client_credentials" }).toString(),
+  });
+
+  if (!r.ok) throw new Error(`Token HTTP ${r.status}: ${await r.text()}`);
+  const j = await r.json();
+
+  cachedToken = j.access_token;
+  const expiresInMs = (Number(j.expires_in) || 60) * 1000;
+  tokenExpiresAt = Date.now() + expiresInMs;
+
+  return cachedToken;
+}
+
+function extractLegifranceId(rawUrl) {
+  const s = String(rawUrl || "").trim();
+
+  // IDs en clair dans l’URL
+  let m = s.match(
+    /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|LEGISCTA\d{12}|JORFSCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
+  );
+  if (m) return m[1];
+
+  // IDs dans query params (cidTexte, idArticle, etc.)
+  try {
+    const u = new URL(s);
+    const candidates = [
+      u.searchParams.get("idArticle"),
+      u.searchParams.get("articleId"),
+      u.searchParams.get("cidTexte"),
+      u.searchParams.get("textCid"),
+      u.searchParams.get("id"),
+    ].filter(Boolean);
+
+    for (const c of candidates) {
+      m = String(c).match(
+        /\b(JORFTEXT\d{12}|LEGITEXT\d{12}|LEGIARTI\d{12}|JORFARTI\d{12}|JORFCONT\d{12}|LEGISCTA\d{12}|JORFSCTA\d{12}|KALITEXT\d{12}|KALIARTI\d{12})\b/
+      );
+      if (m) return m[1];
+    }
+  } catch {}
+
+  return null;
+}
+
+async function pistePost(endpoint, payload) {
+  const token = await getToken();
+  const r = await fetch(API_BASE + endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error(`PISTE ${endpoint} HTTP ${r.status}: ${t}`);
+  }
+  return r.json();
+}
+
+async function consultById(id) {
+  // Important:
+  // - /consult/jorf attend { textCid }
+  // - /consult/legiPart attend { textId, date }
+  // - /consult/getArticle attend { id } pour les articles isolés
+  if (id.startsWith("JORFTEXT")) {
+    return pistePost("/consult/jorf", { textCid: id });
+  }
+  if (id.startsWith("LEGITEXT")) {
+    return pistePost("/consult/legiPart", { date: Date.now(), textId: id });
+  }
+  if (id.startsWith("KALIARTI")) {
+    return pistePost("/consult/kaliArticle", { id });
+  }
+  if (id.startsWith("KALITEXT")) {
+    return pistePost("/consult/kaliText", { id });
+  }
+  // articles / sections divers
+  return pistePost("/consult/getArticle", { id });
+}
+
+// ✅ NOUVEL endpoint attendu par ton AppCore
 app.post("/legifrance/consult", requireApiKey, async (req, res) => {
   try {
     const bodyId = req.body?.id ? String(req.body.id) : null;
@@ -199,7 +208,7 @@ app.post("/legifrance/consult", requireApiKey, async (req, res) => {
   }
 });
 
-// Compat avec ton AppCore (ancienne route)
+// Compat: garde /legifrance/import mais accepte {id,url}
 app.post("/legifrance/import", requireApiKey, async (req, res) => {
   try {
     const bodyId = req.body?.id ? String(req.body.id) : null;
@@ -216,10 +225,13 @@ app.post("/legifrance/import", requireApiKey, async (req, res) => {
 });
 
 /**
- * Deep import:
- * - consult classique (data)
- * - + consult "full" via ELI (full)
- * - + annexes extraites depuis full (si dispo)
+ * ✅ consultDeep:
+ * - récupère le texte (consultById)
+ * - tente de récupérer le contenu des annexes (sections "Annexe") via
+ *   POST /chrono/textCidAndElementCid
+ *
+ * Pourquoi: l'ancien appel "getSection" donne parfois 403, alors que cet endpoint
+ * est documenté et (souvent) autorisé.
  */
 app.post("/legifrance/consultDeep", requireApiKey, async (req, res) => {
   try {
@@ -231,21 +243,45 @@ app.post("/legifrance/consultDeep", requireApiKey, async (req, res) => {
 
     const data = await consultById(id);
 
-    let full = null;
-    let annexes = [];
-    if (data?.eli) {
-      full = await consultFullByEli(data.eli);
-      annexes = extractAnnexesFromFull(full);
+    // Detect annex-like sections (JORF renvoie souvent "Annexe")
+    const sections = Array.isArray(data?.sections) ? data.sections : [];
+    const annexSections = sections.filter((s) => String(s?.title ?? "").toLowerCase().includes("annexe"));
+
+    const annexes = [];
+    for (const s of annexSections) {
+      const sectionCid = String(s?.cid ?? s?.id ?? "");
+      const title = String(s?.title ?? "Annexe");
+
+      if (!sectionCid) {
+        annexes.push({ id: null, title, error: "Missing section cid" });
+        continue;
+      }
+
+      try {
+        // Endpoint OpenAPI: post/chrono/textCidAndElementCid
+        const excerpt = await pistePost("/chrono/textCidAndElementCid", {
+          textCid: id,
+          elementCid: sectionCid,
+        });
+
+        annexes.push({ id: sectionCid, title, excerpt });
+      } catch (err) {
+        annexes.push({ id: sectionCid, title, error: String(err?.message ?? err) });
+      }
     }
 
-    res.json({ id, data, full, annexes });
+    res.json({ id, data, annexes });
   } catch (e) {
     res.status(500).json({ error: String(e?.message ?? e) });
   }
 });
 
-const port = Number(process.env.PORT ?? 8787);
-app.listen(port, () => {
-  // eslint-disable-next-line no-console
-  console.log(`legifrance-proxy listening on :${port} (ENV=${ENV})`);
+const PORT = process.env.PORT || 8787; // 8787 en local, PORT en prod
+app.listen(PORT, () => {
+  console.log(`Legifrance proxy running on :${PORT} (env=${ENV})`);
+  console.log(
+    `[sanity] hasClientId=${Boolean(CLIENT_ID)} hasClientSecret=${Boolean(CLIENT_SECRET)} ` +
+      `clientIdLen=${CLIENT_ID ? String(CLIENT_ID).trim().length : 0} ` +
+      `clientSecretLen=${CLIENT_SECRET ? String(CLIENT_SECRET).trim().length : 0}`
+  );
 });
